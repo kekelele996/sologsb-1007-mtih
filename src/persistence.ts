@@ -4,6 +4,39 @@ import type { PersistedEnvelope, ProjectData } from "./types";
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
 
+export function normalizeProject(project: ProjectData): ProjectData {
+  if (!Array.isArray(project.speakers)) project.speakers = [];
+  if (!Array.isArray(project.tags)) project.tags = [];
+  if (!Array.isArray(project.tracks)) project.tracks = [];
+  const knownSpeakerIds = new Set(project.speakers.map((speaker) => speaker.id));
+  let anonymousCount = 0;
+  for (const track of project.tracks) {
+    if (!Array.isArray(track.segments)) {
+      track.segments = [];
+      continue;
+    }
+    for (const segment of track.segments) {
+      segment.tagIds ??= [];
+      segment.comments ??= [];
+      segment.flags ??= { lowConfidence: false, dialect: false, properNoun: false };
+      segment.speakerId ||= "sp-unregistered";
+      if (!knownSpeakerIds.has(segment.speakerId)) {
+        // Older drafts may reference speaker ids (e.g. "sp-custom") that were
+        // never registered; give them an editable placeholder identity.
+        knownSpeakerIds.add(segment.speakerId);
+        anonymousCount += 1;
+        project.speakers.push({
+          id: segment.speakerId,
+          name: anonymousCount === 1 ? "未登记发言人" : `未登记发言人 ${anonymousCount}`,
+          role: "待确认",
+          color: "#64748b",
+        });
+      }
+    }
+  }
+  return project;
+}
+
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
     return { project: createSeedProject(), revision: 0 };
@@ -11,7 +44,7 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
-      return { project: parsed.project, revision: parsed.revision ?? 0 };
+      return { project: normalizeProject(parsed.project), revision: parsed.revision ?? 0 };
     }
   } catch {
     // A malformed local draft falls back to the bundled sample.
