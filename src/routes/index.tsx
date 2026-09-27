@@ -12,8 +12,15 @@ import {
   onMount,
   untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
+import { createSeedProject, makeSpeaker, uid } from "../data";
+import {
+  downloadText,
+  formatTime,
+  loadProject,
+  parseTime,
+  parseTimedTranscript,
+  saveProject,
+} from "../persistence";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
@@ -23,81 +30,6 @@ function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
   if (status === "offline") return "离线草稿";
   return "已自动保存";
-}
-
-function parseTimedTranscript(input: string, trackName: string): TranscriptTrack {
-  const blocks = input.trim().split(/\n\s*\n/);
-  const segments: Segment[] = [];
-  const srtPattern = /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/;
-  const bracketPattern = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–]?\s*(.*)$/;
-
-  for (const rawBlock of blocks) {
-    const lines = rawBlock.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (!lines.length) continue;
-    const srtIndex = lines.findIndex((line) => srtPattern.test(line));
-    if (srtIndex >= 0) {
-      const match = srtPattern.exec(lines[srtIndex]);
-      const text = lines.slice(srtIndex + 1).join(" ");
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start: parseTime(match?.[1] ?? "0"),
-        end: parseTime(match?.[2] ?? "1"),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
-      continue;
-    }
-    for (const line of lines) {
-      const match = bracketPattern.exec(line);
-      if (!match) continue;
-      const start = parseTime(match[1]);
-      const text = match[2];
-      const speakerName = text.match(/^([^：:]{1,10})[：:]/)?.[1];
-      segments.push({
-        id: uid("seg"),
-        start,
-        end: start + Math.max(3, text.length / 5),
-        speakerId: speakerName ? "sp-custom" : "sp-interviewer",
-        text: text.replace(/^[^：:]{1,10}[：:]\s*/, ""),
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
-    }
-  }
-
-  if (!segments.length && input.trim()) {
-    input.split("\n").map((line) => line.trim()).filter(Boolean).forEach((text, index) => {
-      segments.push({
-        id: uid("seg"),
-        start: index * 6,
-        end: index * 6 + 5.4,
-        speakerId: "sp-interviewer",
-        text,
-        confidence: 3,
-        reviewed: false,
-        flags: { lowConfidence: false, dialect: false, properNoun: false },
-        tagIds: [],
-        comments: [],
-      });
-    });
-  }
-
-  return {
-    id: uid("track"),
-    name: trackName || "导入轨",
-    language: "待识别",
-    status: "待校对",
-    segments,
-  };
 }
 
 export default function OralHistoryEditor() {
@@ -115,6 +47,12 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [speakerManagerOpen, setSpeakerManagerOpen] = createSignal(false);
+  const [newSpeakerName, setNewSpeakerName] = createSignal("");
+  const [speakerDraft, setSpeakerDraft] = createSignal("");
+  const [speakerNameDrafts, setSpeakerNameDrafts] = createSignal<Record<string, string>>({});
+  const [mergeTargets, setMergeTargets] = createSignal<Record<string, string>>({});
+  const [mergeConfirm, setMergeConfirm] = createSignal<{ sourceId: string; targetId: string } | null>(null);
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -321,6 +259,111 @@ export default function OralHistoryEditor() {
     });
   };
 
+  // 跨全部轨道统计某发言人被引用的片段数，用于合并确认与删除拦截。
+  const speakerUsage = (speakerId: string) =>
+    project().tracks.reduce(
+      (total, track) => total + track.segments.filter((segment) => segment.speakerId === speakerId).length,
+      0,
+    );
+
+  const findSpeakerByName = (name: string) =>
+    project().speakers.find((speaker) => speaker.name === name);
+
+  // 片段校对页：输入姓名新建发言人并指派给当前片段；同名直接复用。
+  const assignNewSpeaker = () => {
+    const name = newSpeakerName().trim();
+    if (!name || !activeSegment()) return;
+    const reused = Boolean(findSpeakerByName(name));
+    commit(reused ? "复用同名发言人" : "新建并指派发言人", (draft) => {
+      let speaker = draft.speakers.find((item) => item.name === name);
+      if (!speaker) {
+        speaker = makeSpeaker(name, draft.speakers.length);
+        draft.speakers.push(speaker);
+      }
+      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const segment = track?.segments.find((item) => item.id === selectedId());
+      if (segment) {
+        segment.speakerId = speaker.id;
+        segment.reviewed = false;
+      }
+    });
+    setNewSpeakerName("");
+  };
+
+  const addSpeaker = (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    if (findSpeakerByName(trimmed)) {
+      setLastAction(`发言人「${trimmed}」已存在，同名会自动复用`);
+      return false;
+    }
+    commit("新建发言人", (draft) => {
+      draft.speakers.push(makeSpeaker(trimmed, draft.speakers.length));
+    });
+    return true;
+  };
+
+  const renameSpeaker = (speakerId: string, name: string) => {
+    const trimmed = name.trim();
+    const speaker = project().speakers.find((item) => item.id === speakerId);
+    if (!speaker || !trimmed || trimmed === speaker.name) return;
+    if (project().speakers.some((item) => item.id !== speakerId && item.name === trimmed)) {
+      setLastAction(`已存在同名发言人「${trimmed}」，如需合一请使用合并`);
+      return;
+    }
+    commit(`重命名发言人：${speaker.name} → ${trimmed}`, (draft) => {
+      const target = draft.speakers.find((item) => item.id === speakerId);
+      if (target) target.name = trimmed;
+    });
+  };
+
+  const commitRename = (speakerId: string) => {
+    const draft = speakerNameDrafts()[speakerId];
+    setSpeakerNameDrafts((drafts) => {
+      const next = { ...drafts };
+      delete next[speakerId];
+      return next;
+    });
+    if (draft !== undefined) renameSpeaker(speakerId, draft);
+  };
+
+  // 合并身份：所有轨道的片段改派到保留身份，批注与标注随片段原样保留。
+  const mergeSpeakers = (sourceId: string, targetId: string) => {
+    if (sourceId === targetId) return;
+    const source = project().speakers.find((item) => item.id === sourceId);
+    const target = project().speakers.find((item) => item.id === targetId);
+    if (!source || !target) return;
+    const moved = speakerUsage(sourceId);
+    commit(`合并发言人：${source.name} → ${target.name}（${moved} 段）`, (draft) => {
+      for (const track of draft.tracks) {
+        for (const segment of track.segments) {
+          if (segment.speakerId === sourceId) segment.speakerId = targetId;
+        }
+      }
+      draft.speakers = draft.speakers.filter((item) => item.id !== sourceId);
+    });
+  };
+
+  const removeSpeaker = (speakerId: string) => {
+    const speaker = project().speakers.find((item) => item.id === speakerId);
+    if (!speaker) return;
+    const usage = speakerUsage(speakerId);
+    if (usage > 0) {
+      setLastAction(`无法删除「${speaker.name}」：仍有 ${usage} 段引用，请先改派或合并`);
+      return;
+    }
+    commit(`删除发言人：${speaker.name}`, (draft) => {
+      draft.speakers = draft.speakers.filter((item) => item.id !== speakerId);
+    });
+  };
+
+  const closeSpeakerManager = () => {
+    setSpeakerManagerOpen(false);
+    setSpeakerNameDrafts({});
+    setMergeTargets({});
+    setMergeConfirm(null);
+  };
+
   const exportSrt = () => {
     const lines = activeTrack().segments.map((segment, index) => {
       const speaker = speakerById(segment.speakerId)?.name ?? "未知";
@@ -331,16 +374,24 @@ export default function OralHistoryEditor() {
 
   const importFile = async (file: File) => {
     const text = await file.text();
-    const imported = parseTimedTranscript(text, file.name.replace(/\.[^.]+$/, ""));
+    const { track: imported, newSpeakers } = parseTimedTranscript(
+      text,
+      file.name.replace(/\.[^.]+$/, ""),
+      project().speakers,
+    );
     if (!imported.segments.length) {
       setLastAction("未识别到带时间码的文本");
       return;
     }
-    commit("导入转写文本", (draft) => {
-      draft.tracks.push(imported);
-      draft.activeTrackId = imported.id;
-      setSelectedId(imported.segments[0].id);
-    });
+    commit(
+      newSpeakers.length ? `导入转写文本（登记 ${newSpeakers.length} 位新发言人）` : "导入转写文本",
+      (draft) => {
+        draft.speakers.push(...newSpeakers);
+        draft.tracks.push(imported);
+        draft.activeTrackId = imported.id;
+        setSelectedId(imported.segments[0].id);
+      },
+    );
   };
 
   const resolveConflict = (useIncoming: boolean) => {
@@ -534,6 +585,23 @@ export default function OralHistoryEditor() {
             <div class="hint">支持 SRT / VTT / 每行 `[00:12] 文本`</div>
           </section>
 
+          <section class="panel-section">
+            <div class="section-title"><h2>发言人</h2><span>{project().speakers.length}</span></div>
+            <div class="speaker-list">
+              <For each={project().speakers}>
+                {(speaker) => (
+                  <div class="speaker-row">
+                    <i style={{ background: speaker.color }} />
+                    <span class="speaker-name">{speaker.name}</span>
+                    <small>{speakerUsage(speaker.id)} 段</small>
+                  </div>
+                )}
+              </For>
+            </div>
+            <button class="wide-action" onClick={() => setSpeakerManagerOpen(true)}><span>⚙</span> 管理发言人</button>
+            <div class="hint">重命名 / 合并 / 删除，合并对全部轨道生效</div>
+          </section>
+
           <section class="panel-section tag-summary">
             <div class="section-title"><h2>标注实体</h2><span>{project().tags.length}</span></div>
             <div class="legend">
@@ -625,6 +693,17 @@ export default function OralHistoryEditor() {
                   >
                     <For each={project().speakers}>{(speaker) => <option value={speaker.id}>{speaker.name} · {speaker.role}</option>}</For>
                   </select>
+                  <div class="speaker-assign">
+                    <input
+                      aria-label="新发言人姓名"
+                      placeholder="新发言人姓名…"
+                      value={newSpeakerName()}
+                      onInput={(event) => setNewSpeakerName(event.currentTarget.value)}
+                      onKeyDown={(event) => { if (event.key === "Enter") assignNewSpeaker(); }}
+                    />
+                    <button disabled={!newSpeakerName().trim()} onClick={assignNewSpeaker}>新建并指派</button>
+                  </div>
+                  <div class="textarea-help">同名会自动复用；重命名与合并在左侧“发言人”面板。</div>
 
                   <div class="time-grid">
                     <label>开始<input type="text" value={formatTime(segment().start)} onChange={(event) => commitSegment("修改开始时间", (item) => { item.start = parseTime(event.currentTarget.value); })} /></label>
@@ -725,6 +804,110 @@ export default function OralHistoryEditor() {
         <span>版本 {revision() + 1} · 本地草稿</span>
         <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
       </footer>
+
+      <Dialog open={speakerManagerOpen()} onOpenChange={(open) => (open ? setSpeakerManagerOpen(true) : closeSpeakerManager())}>
+        <Dialog.Portal>
+          <Dialog.Overlay class="dialog-overlay" />
+          <Dialog.Content class="dialog-content speaker-dialog">
+            <Dialog.Title>管理发言人</Dialog.Title>
+            <Dialog.Description>
+              重命名即时生效；合并会把源身份在所有轨道中的片段改派到保留身份，批注与标注随片段保留，操作可撤销。
+            </Dialog.Description>
+
+            <Show when={mergeConfirm()}>
+              {(pending) => (
+                <div class="merge-confirm" role="alert">
+                  <span>
+                    将把「{project().speakers.find((item) => item.id === pending().sourceId)?.name}」的
+                    {speakerUsage(pending().sourceId)} 段（全部轨道）并入「
+                    {project().speakers.find((item) => item.id === pending().targetId)?.name}
+                    」，导出字幕同步使用保留身份。
+                  </span>
+                  <div>
+                    <button class="btn btn-quiet" onClick={() => setMergeConfirm(null)}>取消</button>
+                    <button
+                      class="btn btn-danger"
+                      onClick={() => {
+                        mergeSpeakers(pending().sourceId, pending().targetId);
+                        setMergeConfirm(null);
+                        setMergeTargets({});
+                      }}
+                    >确认合并</button>
+                  </div>
+                </div>
+              )}
+            </Show>
+
+            <div class="speaker-manager-list">
+              <For each={project().speakers}>
+                {(speaker) => {
+                  const usage = () => speakerUsage(speaker.id);
+                  return (
+                    <div class="speaker-manager-row">
+                      <i class="speaker-dot" style={{ background: speaker.color }} />
+                      <div class="speaker-fields">
+                        <input
+                          aria-label={`重命名 ${speaker.name}`}
+                          value={speakerNameDrafts()[speaker.id] ?? speaker.name}
+                          onInput={(event) =>
+                            setSpeakerNameDrafts((drafts) => ({ ...drafts, [speaker.id]: event.currentTarget.value }))}
+                          onBlur={() => commitRename(speaker.id)}
+                          onKeyDown={(event) => { if (event.key === "Enter") commitRename(speaker.id); }}
+                        />
+                        <small>{speaker.role} · {usage()} 段引用</small>
+                      </div>
+                      <div class="speaker-actions">
+                        <select
+                          aria-label={`把 ${speaker.name} 合并到`}
+                          value={mergeTargets()[speaker.id] ?? ""}
+                          onChange={(event) =>
+                            setMergeTargets((targets) => ({ ...targets, [speaker.id]: event.currentTarget.value }))}
+                        >
+                          <option value="">合并到…</option>
+                          <For each={project().speakers.filter((item) => item.id !== speaker.id)}>
+                            {(target) => <option value={target.id}>{target.name}</option>}
+                          </For>
+                        </select>
+                        <button
+                          disabled={!mergeTargets()[speaker.id]}
+                          onClick={() => setMergeConfirm({ sourceId: speaker.id, targetId: mergeTargets()[speaker.id] })}
+                        >并入</button>
+                        <button
+                          class="danger-link"
+                          disabled={usage() > 0}
+                          title={usage() > 0 ? `仍有 ${usage()} 段引用，不能删除` : "删除该发言人"}
+                          onClick={() => removeSpeaker(speaker.id)}
+                        >删除</button>
+                      </div>
+                      <Show when={usage() > 0}>
+                        <p class="speaker-blocked">仍有 {usage()} 段引用，删除前请先改派或合并这些片段。</p>
+                      </Show>
+                    </div>
+                  );
+                }}
+              </For>
+            </div>
+
+            <div class="speaker-add">
+              <input
+                aria-label="新发言人姓名"
+                placeholder="新发言人姓名…"
+                value={speakerDraft()}
+                onInput={(event) => setSpeakerDraft(event.currentTarget.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && addSpeaker(speakerDraft())) setSpeakerDraft("");
+                }}
+              />
+              <button
+                class="btn btn-quiet"
+                disabled={!speakerDraft().trim()}
+                onClick={() => { if (addSpeaker(speakerDraft())) setSpeakerDraft(""); }}
+              >添加发言人</button>
+            </div>
+            <div class="dialog-footer"><button class="btn btn-primary" onClick={closeSpeakerManager}>完成</button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
         <Dialog.Portal>

@@ -1,7 +1,25 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, ProjectData, Segment, Speaker, Tag } from "./types";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+export const SPEAKER_PALETTE = [
+  "#2563eb",
+  "#be185d",
+  "#0f766e",
+  "#b45309",
+  "#7c3aed",
+  "#dc2626",
+  "#15803d",
+  "#9333ea",
+];
+
+export const makeSpeaker = (name: string, index = 0, role = "待确认"): Speaker => ({
+  id: uid("sp"),
+  name,
+  role,
+  color: SPEAKER_PALETTE[index % SPEAKER_PALETTE.length],
+});
 
 export const makeTag = (label: string, type: Tag["type"], color: string): Tag => ({
   id: uid("tag"),
